@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 540 120" width="540" height="120" role="img" aria-label="open-llm-harness">
+  <title>open-llm-harness</title>
+  <g transform="translate(12 12)">
+    <g fill="none" stroke-width="6" stroke-linecap="round">
+      <circle cx="48" cy="48" r="16" stroke="#f5a524" stroke-dasharray="75 200" transform="rotate(20 48 48)"/>
+      <circle cx="48" cy="48" r="28.5" stroke="#2dd4bf" stroke-dasharray="134 400" transform="rotate(140 48 48)"/>
+      <circle cx="48" cy="48" r="41" stroke="#818cf8" stroke-dasharray="193 600" transform="rotate(260 48 48)"/>
+    </g>
+    <circle cx="64" cy="48" r="6.5" fill="#f5a524" transform="rotate(20 48 48)"/>
+    <circle cx="76.5" cy="48" r="6.5" fill="#2dd4bf" transform="rotate(140 48 48)"/>
+    <circle cx="89" cy="48" r="6.5" fill="#818cf8" transform="rotate(260 48 48)"/>
+    <circle cx="48" cy="48" r="6" fill="#f3f4f6"/>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace">
+    <text x="130" y="64" font-size="38" font-weight="700" fill="#f3f4f6">open-<tspan fill="#f5a524">llm</tspan>-harness</text>
+    <text x="131" y="93" font-size="15" fill="#9ca3af">a job queue and sandbox for local models</text>
+  </g>
+</svg>

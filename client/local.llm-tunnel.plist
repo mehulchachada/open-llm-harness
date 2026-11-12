@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- macOS (launchd): ~/Library/LaunchAgents/local.llm-tunnel.plist
+     launchctl load ~/Library/LaunchAgents/local.llm-tunnel.plist
+     Needs the `llmhost-tunnel` entry from ssh_config.example. -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>local.llm-tunnel</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/ssh</string><string>-N</string><string>llmhost-tunnel</string></array>
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+</dict></plist>

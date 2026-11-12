@@ -1,0 +1,14 @@
+# Linux (systemd user unit): ~/.config/systemd/user/llm-tunnel.service
+#   systemctl --user daemon-reload && systemctl --user enable --now llm-tunnel
+# Needs the `llmhost-tunnel` entry from ssh_config.example.
+[Unit]
+Description=SSH tunnel to the GPU machine (Ollama, SearXNG)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/ssh -N llmhost-tunnel
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

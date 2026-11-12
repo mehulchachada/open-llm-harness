@@ -1,0 +1,19 @@
+# Append to ~/.ssh/config on each client machine. Replace the two placeholders.
+
+# Plain host: used by `llm-remote ...`, git, and interactive logins.
+Host llmhost
+  HostName <address of the GPU machine, e.g. 192.168.1.20>
+  User <your user name on it>
+  ServerAliveInterval 30
+
+# Tunnel host (optional): makes the GPU machine's services appear on THIS machine's localhost.
+#   ssh -N llmhost-tunnel      then   http://127.0.0.1:11434  is Ollama on the GPU machine
+# Kept separate so ordinary `ssh llmhost ...` calls never fight over the forwarded ports.
+# Forward only what you run over there; 8888 is SearXNG.
+Host llmhost-tunnel
+  HostName <address of the GPU machine>
+  User <your user name on it>
+  ServerAliveInterval 30
+  ExitOnForwardFailure yes
+  LocalForward 11434 127.0.0.1:11434
+  LocalForward 8888  127.0.0.1:8888

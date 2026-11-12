@@ -1,0 +1,66 @@
+{
+  "ollama": "http://127.0.0.1:11434",
+  "default_model": "",
+  "sync_model": "",
+  "default_ctx": 16384,
+  "max_ctx": 65536,
+  "searxng": "http://127.0.0.1:8888",
+  "dashboard_url": "",
+  "host_name": "",
+  "projects": {
+    "notes": {
+      "path": "/home/me/notes"
+    },
+    "webapp": {
+      "path": "/home/me/src/webapp",
+      "write_globs": ["client/src/*", "server/routes/*.js"],
+      "checks": {
+        "typecheck": {
+          "about": "TypeScript typecheck of the whole client, no target",
+          "cmd": ["npx", "tsc", "-b"],
+          "cwd": "client",
+          "timeout": 300
+        },
+        "test": {
+          "about": "run one vitest file; target = the test file path",
+          "cmd": ["npx", "vitest", "run", "{target}"],
+          "cwd": "client",
+          "target_glob": "src/*",
+          "timeout": 300
+        },
+        "format": {
+          "about": "prettier --write one file; target = the file path",
+          "cmd": ["npx", "prettier", "--write", "{target}"],
+          "cwd": "client",
+          "target_glob": "src/*",
+          "timeout": 120
+        }
+      },
+      "gates": {
+        "typecheck": {
+          "cmd": ["npx", "tsc", "-b"],
+          "cwd": "client",
+          "timeout": 300,
+          "when": ["client/*"]
+        },
+        "tests": {
+          "cmd": ["npx", "vitest", "run", "--reporter=dot"],
+          "cwd": "client",
+          "timeout": 600,
+          "when": ["client/*"]
+        },
+        "format": {
+          "cmd": ["npx", "prettier", "--check", "."],
+          "cwd": ".",
+          "timeout": 300
+        }
+      },
+      "preview": {
+        "base": "http://localhost:5173",
+        "theme_key": "app-theme",
+        "settle_ms": 5000,
+        "local_storage": { "onboarding-done": "1" }
+      }
+    }
+  }
+}

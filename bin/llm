@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Launcher: put this directory on your PATH (or symlink this file into one that is).
+src="${BASH_SOURCE[0]}"; [ -L "$src" ] && src="$(readlink -f "$src" 2>/dev/null || readlink "$src")"
+for py in python3 python py; do "$py" -c "" >/dev/null 2>&1 && break; done   # on Windows `python3` can be a stub
+exec "$py" "$(cd "$(dirname "$src")" && pwd)/llm.py" "$@"
