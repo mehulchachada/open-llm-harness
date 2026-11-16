@@ -208,8 +208,11 @@ removes it; `llm submit --think` sets it for one job.
 Reasoning also needs a ceiling, because `num_predict` is not a reliable one: a turn generating 38k
 tokens under a 13k cap has been observed. A turn that generates more than `think_budget` of the
 window costs the next few turns their reasoning, and a turn that reasons and then says nothing at
-all is not taken for a finished job - it is asked again, with reasoning off. `result.json` records
-`think` and `think_turns`, so the setting can be compared on your own jobs.
+all is not taken for a finished job - it is asked again, with reasoning off. If the job has already
+started work, the model is told to carry on with its next step; only in the last few turns, or once
+the window is nearly full, is it asked to summarise instead, because whatever it says after that is
+taken as its final answer. `result.json` records `think` and `think_turns`, so the setting can be
+compared on your own jobs.
 
 ## Coding jobs
 
@@ -227,6 +230,13 @@ never handed back, because the model cannot fix what it did not break, and askin
 finished job turns into fifty turns of trying to edit a file it has no rights to. Gates that pass
 cost nothing extra. A project with no gates gets `final gate: none configured - UNVERIFIED` in
 the result, so you can tell the difference.
+
+**An open checklist is not "done".** Models are asked to keep `artifacts/NOTES.md` and to tick
+items there (`- [x]`) as they finish them. A final answer while that file still has unticked
+`- [ ]` items is handed back once, with the list. If the model stops again with the list still
+open, the job ends `incomplete` and names the items, even if every gate passed: passing gates say
+nothing is broken, not that the work was done. An item the model cannot do can be marked `- [-]`
+and explained in the summary. `result.json` records `open_items`.
 
 **Pinned state.** Each time old output is removed, the model is shown its own
 `artifacts/NOTES.md`, the list of files it has changed and the last result of each check. The

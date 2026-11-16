@@ -221,8 +221,41 @@ CFG["projects"]["t"]["gates"] = {}
 res, notes, sent = run([[call("write_file", path="artifacts/out.md", content="answer")]] + [mute] * 12)
 check("runaway: a model that has delivered but stays silent still ends ok, not error",
       res["status"] == "ok" and sum("no tool call and no answer" in n for n in notes) == 8)
-check("runaway: having delivered, it is asked for the summary and not for another tool call",
-      any("Reply now in plain text" in m["content"] for m in sent[-1] if m["role"] == "user"))
+check("runaway: mid-job, having started, it is told to carry on - not to summarise and stop",
+      any("carry on with the next unfinished step" in m["content"] for m in sent[2] if m["role"] == "user")
+      and not any("Reply now in plain text" in m["content"] for m in sent[-1] if m["role"] == "user"))
+res, notes, sent = run([[call("write_file", path="artifacts/out.md", content="answer")]] + [mute] * 12,
+                       front="max_turns: 6\n")
+check("runaway: in the last turns of the job it is asked for the summary instead",
+      any("Reply now in plain text" in m["content"] for m in sent[2] if m["role"] == "user"))
+
+# O2. the job that ended "ok" at turn 19 of 90: a runaway, then a progress report taken for the
+#     final answer while the model's own checklist was still open
+OPEN2 = "## Status\n- [ ] item 1: spacing\n- [ ] item 2: padding\n"
+res, notes, sent = run([[call("write_file", path="artifacts/NOTES.md", content=OPEN2)],
+                        [call("write_file", path="repo/o.txt", content="1")],
+                        mute,
+                        "Status so far: I am mid-item-1.",
+                        [call("write_file", path="artifacts/NOTES.md",
+                              content="- [x] item 1: spacing\n- [-] item 2: padding (no such table)\n")],
+                        "Done. Item 2 could not be done: there is no such table."])
+check("open items: a final answer while NOTES.md has unticked items is handed back, not accepted",
+      any("2 unticked item(s)" in n and "handed back" in n for n in notes)
+      and any("- [ ] item 2: padding" in m["content"] for m in sent[4] if m["role"] == "user"))
+check("open items: ticked and explicitly dropped items let the job finish ok",
+      res["status"] == "ok" and res["stats"]["open_items"] == 0 and res["final"].startswith("Done."))
+res, notes, sent = run([[call("write_file", path="artifacts/NOTES.md", content=OPEN2)],
+                        [call("write_file", path="repo/o.txt", content="2")],
+                        "Status so far: I am mid-item-1.", "Still mid-item-1."])
+check("open items: stopping again with the list still open ends incomplete, not ok",
+      res["status"] == "incomplete" and "2 unticked item(s)" in (res["error"] or "")
+      and "item 1: spacing" in res["error"] and res["stats"]["open_items"] == 2)
+check("open items: handed back once only", sum("handed back to the model" in n for n in notes) == 1)
+res, notes, sent = run([[call("write_file", path="artifacts/NOTES.md", content="- [x] all of it\n")],
+                        [call("write_file", path="repo/o.txt", content="3")], "done"])
+check("open items: a fully ticked list, or none at all, costs nothing",
+      res["status"] == "ok" and not any("unticked" in n for n in notes) and len(sent) == 3)
+(repo / "o.txt").unlink(missing_ok=True)
 
 # P. a model without thinking is untouched by any of this
 CAPS[:] = ["tools"]
