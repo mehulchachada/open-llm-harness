@@ -8,7 +8,8 @@ Runs on that machine; other machines call it over SSH (see client/).
   llm newid [--from NAME]                              reserve a job id
   llm put ID NAME                                      stdin -> runs/ID/context/NAME
   llm submit [-] [--id ID] [--from X] [--project P] [--model M] [--ctx N] [--web]
-             [--return answer|report|patch|pr] [--parent SESSION | --no-parent] [ASK...]
+             [--return answer|report|patch|pr] [--parent SESSION | --no-parent]
+             [--think on|auto|off] [ASK...]
                                                        queue an async job (`-`: job file on stdin)
   llm lint FILE                                        check a coding brief for the usual gaps (advice only)
   llm status ID                                        one line: queued (position) / running (time, turn) / done
@@ -148,7 +149,7 @@ def cmd_submit(a):
         meta, body = {}, ask
     if not body.strip():
         die("empty job")
-    for k, v in (("from", a.from_), ("project", a.project), ("model", a.model), ("ctx", a.ctx),
+    for k, v in (("from", a.from_), ("project", a.project), ("model", a.model), ("ctx", a.ctx), ("think", a.think),
                  ("return", a.return_), ("web", "true" if a.web else None), ("parent_session", a.parent),
                  ("edit", "true" if a.edit else None), ("max_turns", a.max_turns),
                  ("group", a.group), ("step", a.step)):
@@ -173,7 +174,7 @@ def cmd_submit(a):
     # Advice only: a brief with these gaps is the usual reason a coding job loops or drifts.
     for w in brieflint.lint(meta, body, C.config()):
         print(f"llm: brief warning: {w}", file=sys.stderr)
-    front = "\n".join(f"{k}: {meta[k]}" for k in ("id", "from", "submitted", "parent_session", "project", "model", "ctx", "web", "edit",
+    front = "\n".join(f"{k}: {meta[k]}" for k in ("id", "from", "submitted", "parent_session", "project", "model", "ctx", "think", "web", "edit",
                                                          "max_turns", "group", "step", "return") if meta.get(k))
     path = B / "jobs" / "inbox" / f"{jid}.md"
     with C.repo_lock():
@@ -357,6 +358,7 @@ def main():
     p = sub.add_parser("submit"); p.add_argument("ask", nargs="*"); p.add_argument("--id")
     p.add_argument("--from", dest="from_"); p.add_argument("--project"); p.add_argument("--model")
     p.add_argument("--ctx", type=int); p.add_argument("--web", action="store_true")
+    p.add_argument("--think", choices=["on", "auto", "off"], help="reasoning for this job: every turn, only where the turn needs a decision, or never (default: the config)")
     p.add_argument("--return", dest="return_", choices=["answer", "report", "patch", "pr"])
     p.add_argument("--parent", help="id of the Claude Code session orchestrating this job (default: the calling session)")
     p.add_argument("--no-parent", action="store_true", help="file the job as standalone")

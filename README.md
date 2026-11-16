@@ -135,6 +135,7 @@ is for anything that has to look at a project, takes more than one step, or shou
 project: webapp          # optional: mounts shared/ and repo/
 model: your-model:tag    # optional: any installed model
 ctx: 32768               # optional, tokens
+think: auto              # optional: on | auto | off - how much reasoning to pay for
 web: true                # optional: adds web_search and web_fetch
 edit: true               # optional: edit rights on the project's writable paths, plus its checks
 max_turns: 80            # optional (default 30, max 300)
@@ -185,13 +186,30 @@ turn it takes the prompt size Ollama reports and recalibrates its characters-per
   recent are always kept, and the full text stays in the transcript.
 - At 70%, reading and searching are switched off and the model is told to finish with what it has.
 - A single read can never push the window past 75%. It is cut short instead.
-- One turn may generate at most a fifth of the window. A model that spends a whole turn
-  reasoning without acting is cut off and retried with reasoning switched off.
+- One turn may generate at most a fifth of the window, as far as the backend enforces it. A turn
+  that reasons without acting is retried with reasoning switched off.
 
 A job that still runs out of room ends as `status: error` with the reason. It does not come back
 as an empty "ok".
 
 The default window is 16k tokens. Ask for more per job with `--ctx`, up to `max_ctx` in the config.
+
+## Reasoning
+
+On a reasoning model, thinking is the largest thing a job generates, and it is dropped after the
+turn: it is in the transcript, and sending it back is the biggest avoidable context cost. So the
+harness spends it where it changes the next move. With `think: auto`, the default, reasoning is
+asked for on the first turn, on a turn that follows something arriving from outside (a file, a
+search, a page, a picture), on a failure to diagnose, and on any turn the harness interrupted with
+a nudge, a pinned state or a failed gate. A turn that only acknowledges the model's own successful
+write, or a check that passed, gets none. `think: on` restores it everywhere and `think: off`
+removes it; `llm submit --think` sets it for one job.
+
+Reasoning also needs a ceiling, because `num_predict` is not a reliable one: a turn generating 38k
+tokens under a 13k cap has been observed. A turn that generates more than `think_budget` of the
+window costs the next few turns their reasoning, and a turn that reasons and then says nothing at
+all is not taken for a finished job - it is asked again, with reasoning off. `result.json` records
+`think` and `think_turns`, so the setting can be compared on your own jobs.
 
 ## Coding jobs
 
@@ -202,7 +220,12 @@ file. Around the model, the harness does the following:
 **The final gate.** When the model says it is done and it has changed files, the harness runs
 the project's gate commands itself: typecheck, tests, formatting, whatever you listed. A failure
 goes back to the model to fix, twice. After that the job is `error: final gate failed`, whatever
-the model claimed. A project with no gates gets `final gate: none configured - UNVERIFIED` in
+the model claimed - but only for a gate this job broke. When a gate fails, the harness re-runs it
+once on the files as they were before the job (it swaps the job's changes out, runs that gate, and
+swaps them back). A gate that fails there too was already red: it is reported (`pre-failing`) and
+never handed back, because the model cannot fix what it did not break, and asking it to is how a
+finished job turns into fifty turns of trying to edit a file it has no rights to. Gates that pass
+cost nothing extra. A project with no gates gets `final gate: none configured - UNVERIFIED` in
 the result, so you can tell the difference.
 
 **Pinned state.** Each time old output is removed, the model is shown its own
