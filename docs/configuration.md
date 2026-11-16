@@ -27,6 +27,10 @@ may run.
 | `sync_model` | `""` | Model for `llm ask` when nothing is loaded. Something small that loads fast is a good choice. Empty means the same as `default_model`. |
 | `default_ctx` | `16384` | Context window for a job that does not ask for one. |
 | `max_ctx` | `65536` | Upper limit for `--ctx`. Set it to what fits in your VRAM with the default model. |
+| `think` | `"auto"` | Reasoning, on a model that has it: `on` every turn, `auto` only where the turn decides something, `off` never. A job overrides it with `--think`. |
+| `think_level` | `""` | If the backend takes a reasoning level (`low`, `medium`, `high`), the level to ask for on a thinking turn. Empty sends a plain on/off. |
+| `think_budget` | `0.10` | Share of the window one turn may generate before reasoning is switched off for the next few turns. `0` removes the ceiling. |
+| `gate_baseline` | `true` | When a gate fails, re-run it on the files as they were before the job, so a gate that was already failing is reported rather than charged to the model. Costs nothing when the gates pass. |
 | `searxng` | `http://127.0.0.1:8888` | SearXNG instance used by `web_search`. Only jobs with `web: true` touch it. It must have the JSON output format enabled. |
 | `dashboard_url` | `""` | Optional live reporting, see [dashboard.md](dashboard.md). Empty means off. |
 | `host_name` | `""` | This machine's name in job ids and commit messages. Empty means the hostname. |
@@ -37,6 +41,26 @@ loaded if there is one, otherwise on the first installed model, and in both case
 can call tools is preferred over one that cannot. That is fine for trying things out. Once you
 have more than one model installed, name the one you want; `llm models` lists what is installed
 and what each can do. A job can always ask for a specific model with `--model`.
+
+## Reasoning
+
+On a reasoning model, thinking is the largest thing a job generates, and the harness drops it after
+the turn: it is already in the transcript, and sending it back is the biggest avoidable context
+cost. That makes it worth spending deliberately rather than everywhere.
+
+With `think: auto` the harness asks for reasoning on the turns that decide something - the first
+turn, a turn that follows something arriving from outside (a file, a search, a page, a picture), a
+failure to diagnose, and any turn the harness itself interrupted with a nudge, a pinned state or a
+failed gate. A turn that only acknowledges the model's own successful write, or a check that passed,
+gets none. There is also a floor, so a long run of mechanical turns still reasons occasionally.
+
+`num_predict` is not a reliable ceiling on reasoning - a turn generating 38k tokens under a 13k cap
+has been observed - so `think_budget` backs it up after the fact: a turn that generates more than
+that share of the window costs the next few turns their reasoning. Without it, one runaway turn
+tends to become a run of them.
+
+`result.json` records `think` and `think_turns` for every job, so the setting can be compared
+against your own work rather than taken on trust.
 
 ## Projects
 
@@ -111,6 +135,13 @@ the repo. The model cannot skip them.
   the job ends as `error: final gate failed`.
 - A project with no gates still lets edit jobs finish, but the result says
   `final gate: none configured - UNVERIFIED`.
+- With `gate_baseline` on, a gate that fails is re-run once on the files as they were before the
+  job: the harness puts back the original versions of the files the job changed, runs only the
+  failing gates, then restores the job's versions (kept in `<run-dir>/gate-swap/` until they are
+  back, so a crash loses nothing). A gate that also fails there was red before the model arrived:
+  it is not handed back and not counted against the job, the gate status reads `pre-failing`, and
+  the Result section names it. A job whose gates pass pays nothing for this. If a changed file was
+  too large to keep a copy of (over 1 MB), the swap is skipped and the failure counts as the job's.
 
 Checks are for the model's own loop; gates are the verdict. It is normal for the same command to
 appear in both.

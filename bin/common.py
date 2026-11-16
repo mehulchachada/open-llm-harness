@@ -23,6 +23,14 @@ DEFAULT_CONFIG = {
     "sync_model": "",                   # `llm ask` when no model is loaded; "" = same as default_model
     "default_ctx": 16384,
     "max_ctx": 65536,                   # ceiling for --ctx. Set it to what fits in your VRAM
+    "think": "auto",                    # reasoning, for a model that has it: "on" every turn, "auto"
+                                        # only on the turns that need a decision, "off" never
+    "think_level": "",                  # if the backend takes a reasoning level ("low"/"high"/...),
+                                        # the level to ask for on a thinking turn; "" sends on/off
+    "think_budget": 0.10,               # one turn may spend this share of the window generating before
+                                        # reasoning is switched off for a few turns; 0 = no ceiling
+    "gate_baseline": True,              # when a gate fails, re-run it on the files as they were before
+                                        # the job, so one that was already red is not the model's fault
     "searxng": "http://127.0.0.1:8888", # only used by jobs with `web: true`
     "dashboard_url": "",                # optional live run reporting (docs/dashboard.md); "" = off
     "host_name": "",                    # this machine's name in job ids; "" = taken from the hostname

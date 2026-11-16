@@ -26,13 +26,22 @@ ELIDE_AT = 0.50              # past here, old tool output is removed from the co
 WRAP_AT = 0.70               # still this full after eliding: reading is switched off, the model must finish
 KEEP_RESULTS = 6             # most recent tool results that are never elided
 CHECK_TAIL = 6000            # chars of a check's output handed back to the model
-TURN_SHARE = 0.20            # one turn (reasoning + output) may generate at most this share of the window
+TURN_SHARE = 0.20            # one turn (reasoning + output) may generate at most this share of the window,
+                             # as far as the backend honours it: Ollama does not reliably count a model's
+                             # reasoning against num_predict, so THINK_BUDGET backs this up after the fact
 MAX_RECOVERIES = 8           # turns that may be cut off for over-reasoning before the job is failed
+THINK_EVERY = 5              # think: auto - allow a thinking turn at least this often even if nothing asks
+THINK_COOLDOWN = 3           # turns with reasoning switched off after a runaway or an over-budget turn
+THINK_BUDGET_MIN = 4096      # ... but never call a turn a runaway below this, however small the window
+THINK_AFTER = {"read_file", "search", "list_dir", "screenshot", "web_search", "web_fetch"}
 
 CUT_NUDGE = ("Your last turn was cut off: you spent the whole turn reasoning and produced no tool call. "
              "Reasoning is thrown away, so drafting code there is wasted. Do not plan further. Make the "
              "next tool call now: write the file with write_file (a first version is fine), then run the "
              "checks and improve it with edit_file.")
+SUMMARY_NUDGE = ("Your last turn produced only reasoning: no tool call and no answer, so nothing of it was "
+                 "kept. Do not reason further and do not start new work. Reply now in plain text: what you "
+                 "did, file by file, and anything you could not finish or could not check.")
 READ_CHUNK = 12000           # max chars one read_file / web_fetch returns
 GATE_ROUNDS = 2              # times the model gets a failed final gate back to fix before the job is failed
 GATE_TAIL = 2500             # chars of one failed gate's output handed back to the model
@@ -108,6 +117,11 @@ look at it before you finish - layout problems do not show up in tests. Compare 
 fix what is wrong, and say in your summary what you saw."""
 
 
+def stale_gates(result):
+    """Gates that were already failing before the job, as recorded on the result."""
+    return (result.get("gate") or {}).get("already_failing") or []
+
+
 # ------------------------------------------------------------------ sandbox
 class Budget(Exception):
     pass
@@ -151,6 +165,7 @@ class Sandbox:
         self.shots, self.new_images = 0, []
         self.turn, self.clock = 0, 0      # current turn; a counter that orders edits and checks
         self.before = {}                  # repo path -> text before this job first wrote it (None = new file)
+        self.before_raw = {}              # repo path -> (existed, exact bytes or None if too large to keep)
         self.history = {}                 # repo path -> [(turn, text after that write)]
         self.touch_clock, self.last_check_clock = {}, 0
 
@@ -352,6 +367,12 @@ class Sandbox:
         if rel and rel not in self.before:
             self.before[rel] = self._text(p) if p.exists() else None
             self.history[rel] = []
+            existed = p.exists()
+            try:
+                raw = p.read_bytes() if existed and p.stat().st_size <= SNAPSHOT_MAX else None
+            except OSError:
+                raw = None
+            self.before_raw[rel] = (existed, raw)
 
     def _touch(self, p):
         """Remember a file this job wrote inside the repo (gate, pinned state, patch and warnings use it)."""
@@ -411,6 +432,67 @@ class Sandbox:
                                    spec.get("timeout", 600))
             out.append({"name": name, "passed": code == 0, "output": text})
         return out
+
+    def gates_before(self, names):
+        """Run the named gates against the repository as it was BEFORE this job, to tell a gate the job
+        broke from one that was already red. Only the files this job changed are swapped, for as long
+        as the gates take, and the job's versions are put back in a `finally`.
+
+        Returns {name: passed}, or None when the pre-job state cannot be rebuilt exactly (a changed
+        file was too large to keep a copy of) - the caller then treats the failure as the job's, which
+        is what it did before this check existed: slower, never wrong."""
+        root = self.mounts["repo"][0].resolve()
+        plan = []
+        for rel in self.touched:
+            existed, raw = self.before_raw.get(rel, (True, None))
+            if existed and raw is None:
+                return None
+            plan.append((rel, existed, raw))
+        # The job's current versions go outside the repo first, so a crash mid-swap loses nothing:
+        # they sit in <run-dir>/gate-swap until they are back in place.
+        keep = self.run_dir / "gate-swap"
+        keep.mkdir(parents=True, exist_ok=True)
+        saved = []
+        for i, (rel, _, _) in enumerate(plan):
+            p = root / rel
+            q = keep / f"{i}.bin"
+            if p.exists():
+                q.write_bytes(p.read_bytes())
+                saved.append((rel, q))
+            else:
+                saved.append((rel, None))
+        (keep / "INDEX.txt").write_text("\n".join(f"{i}.bin -> repo/{rel}" for i, (rel, _) in enumerate(saved)),
+                                        encoding="utf-8")
+        results, lost = {}, []
+        try:
+            for rel, existed, raw in plan:
+                p = root / rel
+                if existed:
+                    p.write_bytes(raw)
+                elif p.exists():
+                    p.unlink()
+            for name in names:
+                spec = self.gates[name]
+                code, _ = self._run(list(spec["cmd"]), (root / spec.get("cwd", ".")).resolve(),
+                                    spec.get("timeout", 600))
+                results[name] = code == 0
+        finally:
+            for rel, q in saved:
+                try:
+                    p = root / rel
+                    if q is not None:
+                        p.parent.mkdir(parents=True, exist_ok=True)
+                        p.write_bytes(q.read_bytes())
+                    elif p.exists():
+                        p.unlink()
+                except OSError:
+                    lost.append(rel)
+            if not lost:
+                shutil.rmtree(keep, ignore_errors=True)
+        if lost:
+            raise RuntimeError(f"could not put back {', '.join(lost)} after the pre-job gate check; "
+                               f"the job's versions are in {keep}")
+        return results
 
     def state(self):
         """What the model must not lose when old output is removed: its notes, the files it changed and
@@ -667,6 +749,19 @@ def main():
             num_ctx = cfg["default_ctx"]
         num_ctx = max(4096, min(num_ctx, cfg["max_ctx"]))
         max_turns = max(1, min(int(meta.get("max_turns") or 30), 300))
+        # Reasoning is the most expensive thing a job generates and it is dropped after the turn, so how
+        # much of it to pay for is a setting. A job may name its own; otherwise this machine's config does.
+        think_mode = str(meta.get("think") or cfg.get("think") or "auto").strip().lower()
+        if think_mode not in ("on", "auto", "off"):
+            think_mode = "auto"
+        think_level = str(cfg.get("think_level") or "").strip().lower() or None
+        try:
+            think_budget = max(0.0, float(cfg.get("think_budget") or 0))
+        except (TypeError, ValueError):
+            think_budget = 0.0
+        # A share of a small window is an ordinary turn, not a runaway: 10% of 16k is 1.6k tokens, which
+        # normal reasoning reaches. The floor keeps this a runaway detector at every window size.
+        think_cap = max(int(think_budget * num_ctx), THINK_BUDGET_MIN) if think_budget else 0
         read_budget = int(num_ctx * CHARS_PER_TOKEN * 0.5)      # inline pack size for tool-less models
         sb = Sandbox(run_dir, meta.get("project"), cfg, num_ctx, C.truthy(meta.get("web")),
                      edit=C.truthy(meta.get("edit")))
@@ -675,7 +770,8 @@ def main():
 
         tr.log(type="job_start", job_id=job_id, model=model, num_ctx=num_ctx,
                **{"from": meta.get("from")}, project=meta.get("project"), web=sb.web,
-               mounts=sorted(sb.mounts), read_ceiling_tokens=int(READ_CEILING * num_ctx), tools=use_tools, ask=ask)
+               mounts=sorted(sb.mounts), read_ceiling_tokens=int(READ_CEILING * num_ctx), tools=use_tools,
+               think=think_mode, think_budget_tokens=think_cap or None, ask=ask)
         if dash.start(model, ask, meta.get("group"), meta.get("step")):
             tr.log(type="note", text=f"dashboard: {dash.where['mode']} run -> {dash.where['url']}")
 
@@ -708,19 +804,48 @@ def main():
                         {"role": "user", "content": ask + ("\n\n" + "\n\n".join(pack) if pack else "")}]
             tr.log(type="note", text=f"{model} has no tool support: single-shot with {read_budget - room} chars of context inline")
 
+        # A gate that is already red fails every job on the project until someone notices, and the
+        # model cannot fix what it did not break - worse, the hand-back sends it looking for a way,
+        # which is how a finished job turns into fifty turns of flailing. So when a gate fails, check
+        # whether it also fails on the files as they were before the job. A gate that passes needs
+        # no such check, so a job whose gates pass pays nothing for this.
+        pre_failing, checked_before = set(), set()
+
+        def classify(report):
+            todo = [g["name"] for g in report if not g["passed"] and g["name"] not in checked_before]
+            if not todo or not cfg.get("gate_baseline", True):
+                return
+            checked_before.update(todo)
+            t0 = time.time()
+            before = sb.gates_before(todo)
+            if before is None:
+                tr.log(type="note", text="pre-job gate check skipped: a file this job changed is too large "
+                       f"to restore exactly, so {', '.join(todo)} counts as this job's")
+                return
+            pre_failing.update(n for n in todo if not before[n])
+            tr.log(type="note", text=f"pre-job gate check ({time.time() - t0:.0f}s): " + ", ".join(
+                f"{n}={'ALSO FAILED BEFORE THE JOB' if not before[n] else 'passed before the job'}" for n in todo))
+
         tools, totals = (tool_schema(sb) if use_tools else None), {"prompt": 0, "eval": 0}
         # What the job would be billed for on a metered API: every turn re-sends the conversation, so
         # the part already sent last turn counts as cached input and only the growth as fresh input.
         usage = {"fresh": 0, "cached": 0, "prev": 0, "tool_calls": 0, "checks": 0}
         turn_cap, no_think, recoveries = max(4096, int(num_ctx * TURN_SHARE)), 0, 0
+        think_next, last_think, think_turns = False, 0, 0
         idle_reads, stall_nudges, gate_rounds, stalled = 0, 0, 0, False
 
         def record_gate(report):
-            failed = [g["name"] for g in report if not g["passed"]]
-            result["gate"] = {"status": "failed" if failed else "passed", "rounds": gate_rounds + 1,
+            # Only gates this job broke count against it. One that was already failing is reported, so
+            # the result is never quietly called verified, but it is not the model's to answer for.
+            failed = [g["name"] for g in report if not g["passed"] and g["name"] not in pre_failing]
+            stale = [g["name"] for g in report if not g["passed"] and g["name"] in pre_failing]
+            result["gate"] = {"status": "failed" if failed else ("pre-failing" if stale else "passed"),
+                              "rounds": gate_rounds + 1,
                               "checks": [{"name": g["name"], "passed": g["passed"]} for g in report]}
+            if stale:
+                result["gate"]["already_failing"] = stale
             tr.log(type="gate", round=gate_rounds + 1, status=result["gate"]["status"],
-                   checks=result["gate"]["checks"],
+                   checks=result["gate"]["checks"], already_failing=stale or None,
                    failed_output={g["name"]: g["output"][-GATE_TAIL:] for g in report if not g["passed"]})
             return failed
         for turn in range(1, max_turns + 1):
@@ -730,8 +855,20 @@ def main():
             if tools:
                 payload["tools"] = tools
             if "thinking" in caps:
-                payload["think"] = no_think <= 0      # switched off for a few turns after a runaway
+                # With think: auto, reasoning is spent only where it changes what the model does next -
+                # the first turn, anything that just arrived from outside (a file, a search, a page, a
+                # picture), a failure to diagnose, and whatever the harness has just interrupted with.
+                # Acknowledging its own successful write, or a check that passed, needs no reasoning.
+                # think: off sends False rather than nothing: a thinking model reasons by default.
+                on = think_mode != "off" and (think_mode == "on" or think_next or turn == 1
+                                              or turn - last_think >= THINK_EVERY)
+                if no_think > 0:
+                    on = False                        # cooling off after a runaway or an over-budget turn
+                payload["think"] = think_level if (on and think_level) else on
+                if on:
+                    last_think, think_turns = turn, think_turns + 1
             no_think -= 1
+            think_next = False
             t0 = time.time()
             resp = C.ollama("/api/chat", payload)
             dur = int((time.time() - t0) * 1000)
@@ -772,40 +909,68 @@ def main():
                 parsed.append((dash.new_call_id(), name, args if isinstance(args, dict) else {}))
             line = dash.assistant_line(msg.get("thinking"), msg.get("content"), parsed, ptok, etok)
 
-            if resp.get("done_reason") == "length" and not calls and use_tools and recoveries < MAX_RECOVERIES:
-                # A turn that hit its allowance without acting: almost always the model drafting whole
-                # files in its reasoning. Do not fail the job; cut the reasoning and make it act.
-                recoveries, no_think = recoveries + 1, 2
-                tr.log(type="note", text=f"turn {turn} cut off after {etok} generated tokens with no tool call; "
-                       f"retrying with reasoning switched off ({recoveries}/{MAX_RECOVERIES})")
-                messages.append({"role": "user", "content": CUT_NUDGE})
+            # A turn that generated and did not act. done_reason alone does not catch these: Ollama does
+            # not always count reasoning against num_predict (38k generated tokens under a 13k cap has
+            # been seen), and a model that reasons and then stops reports "stop" like a finished turn.
+            thought = len(msg.get("thinking") or "")
+            cut = resp.get("done_reason") == "length"
+            mute = bool(thought) and not msg.get("content", "").strip()
+            if (cut or mute) and not calls and use_tools and recoveries < MAX_RECOVERIES:
+                # Drafting whole files in reasoning, or reasoning in circles and saying nothing. Do not
+                # fail the job; cut the reasoning and ask for whichever of the two was missing.
+                recoveries, no_think = recoveries + 1, THINK_COOLDOWN
+                did_work = bool(sb.touched) or any(f.is_file() for f in (run_dir / "artifacts").rglob("*"))
+                tr.log(type="note", text=f"turn {turn} generated {etok} tokens ({thought} chars of reasoning) "
+                       f"with no tool call and no answer; retrying with reasoning switched off "
+                       f"({recoveries}/{MAX_RECOVERIES})")
+                messages.append({"role": "user",
+                                 "content": SUMMARY_NUDGE if (mute and did_work) else CUT_NUDGE})
                 continue
+
+            # num_predict did not hold, so hold the line here: a turn that generated more than the budget
+            # costs the next few turns their reasoning. Without this, one runaway turn becomes a run of them.
+            if think_cap and thought and etok > think_cap and no_think <= 0:
+                no_think = THINK_COOLDOWN
+                tr.log(type="note", text=f"turn {turn} generated {etok} tokens, over the reasoning budget of "
+                       f"{think_cap}; reasoning off for the next {THINK_COOLDOWN} turns")
 
             if not calls:
                 final_line = line
                 made = any(f.is_file() for f in (run_dir / "artifacts").rglob("*"))
                 if resp.get("done_reason") == "length" or not (msg.get("content", "").strip() or made):
+                    # Two different failures used to share one message. A window that is genuinely full
+                    # wants a bigger ctx; a model that reasoned the window full wants less reasoning, and
+                    # telling that one to raise ctx only buys room for a longer runaway.
                     result.update(status="error", final=msg.get("content", ""), error=(
-                        f"model ran out of context before finishing (window {num_ctx} tokens, "
-                        f"{round(100 * (ptok + etok) / num_ctx)}% used). Resubmit with a larger ctx or a narrower ask."))
+                        f"model ran out of context before finishing (window {num_ctx} tokens, the prompt "
+                        f"alone was {ptok} = {round(100 * ptok / num_ctx)}%). Resubmit with a larger ctx "
+                        f"or a narrower ask." if ptok > 0.85 * num_ctx else
+                        f"the model generated {etok} tokens on its last turn ({thought} chars of it "
+                        f"reasoning) and gave neither an answer nor a tool call, with the prompt at "
+                        f"{round(100 * ptok / num_ctx)}% of the {num_ctx} token window. That is a reasoning "
+                        f"runaway, not a full window: resubmit with `think: off` or a narrower ask."))
                     break
                 # The model says it is done. Its word is not the verdict: the harness runs the gate.
                 if sb.touched and sb.gates:
                     report = sb.run_gates()
+                    classify(report)
                     failed = record_gate(report)
                     if failed and gate_rounds < GATE_ROUNDS and turn < max_turns:
                         gate_rounds += 1
                         detail = "\n\n".join(f"### gate `{g['name']}`: FAILED\n{g['output'][-GATE_TAIL:]}"
-                                               for g in report if not g["passed"])
+                                               for g in report if not g["passed"] and g["name"] in failed)
                         sb.pending += len(detail) / sb.ratio
                         messages.append(kept)
+                        think_next = True
                         messages.append({"role": "user", "content": GATE_NUDGE.format(report=detail)})
                         tr.log(type="note", text=f"final gate failed ({', '.join(failed)}): handed back to the "
                                f"model, round {gate_rounds}/{GATE_ROUNDS}")
                         continue
                     if failed:
                         result.update(status="error", final=msg.get("content", ""),
-                                      error=f"final gate failed: {', '.join(failed)} (after {gate_rounds} fix rounds)")
+                                      error=f"final gate failed: {', '.join(failed)} (after {gate_rounds} fix rounds)"
+                                            + (f"; already failing before this job: {', '.join(stale_gates(result))}"
+                                               if stale_gates(result) else ""))
                         break
                 elif sb.touched:
                     result["gate"] = {"status": "none", "rounds": 0, "checks": []}
@@ -832,6 +997,8 @@ def main():
                        dur_ms=int((time.time() - t0) * 1000), preview=out[:600])
                 dash.tool_post(name, args, call_id, out, err)
                 messages.append({"role": "tool", "tool_name": name, "content": out})
+                if err or name in THINK_AFTER or (name == "check" and ": FAILED" in out[:120]):
+                    think_next = True
                 if name in READ_TOOLS:
                     idle_reads += 1
                 elif name in PROGRESS_TOOLS and not err and not str(args.get("path", "")).startswith("artifacts"):
@@ -858,6 +1025,7 @@ def main():
                     break
                 note = STALL_NUDGE.format(n=idle_reads, state=sb.state())
                 sb.pending += len(note) / sb.ratio
+                think_next = True
                 messages.append({"role": "user", "content": note})
                 tr.log(type="note", text=f"loop detector: {idle_reads} reads in a row without progress, "
                        f"warning {stall_nudges}/{STALL_NUDGES}")
@@ -878,11 +1046,13 @@ def main():
                         pin = ("[Pinned by the harness: old tool output was just removed. This is your state - "
                                "do not re-read files to rebuild it, continue with the next step.]\n" + sb.state())
                         sb.pending += len(pin) / sb.ratio
+                        think_next = True
                         messages.append({"role": "user", "pin": True, "content": pin})
                     used = (sb.base + sb.pending) / num_ctx
             if used >= WRAP_AT and not sb.closed:
                 sb.closed = True
                 tools = [t for t in tools if t["function"]["name"] in ("write_file", "edit_file", "check", "screenshot")]
+                think_next = True
                 messages.append({"role": "user", "content": "Your context window is nearly full, so reading "
                                  "and searching are now switched off. Finish with what you have: complete the "
                                  "deliverable, then give your final summary. Say what you could not check."})
@@ -891,7 +1061,9 @@ def main():
             result.update(status="error", error=f"hit max_turns={max_turns} without finishing")
         # A job that did not finish cleanly still gets the gate, so the report says what state it left.
         if "gate" not in result and sb.touched and sb.gates and result["status"] == "error":
-            record_gate(sb.run_gates())
+            report = sb.run_gates()
+            classify(report)
+            record_gate(report)
 
         # What the job changed, as a patch a reviewer can read or apply, and the warnings that go with it.
         patch, changed, warnings = sb.changes(turn)
@@ -915,7 +1087,9 @@ def main():
                            "gate": (result.get("gate") or {}).get("status"), "stalled": stalled,
                            "screenshots": sb.shots, "files_changed": len(sb.touched),
                            "lines_added": sum(c["added"] for c in changed),
-                           "lines_removed": sum(c["removed"] for c in changed), "warnings": len(warnings)}
+                           "lines_removed": sum(c["removed"] for c in changed), "warnings": len(warnings),
+                           "think": think_mode, "think_turns": think_turns,
+                           "gates_already_failing": len(stale_gates(result))}
     except Exception as e:
         result.update(status="error", error=f"{type(e).__name__}: {e}")
 

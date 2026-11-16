@@ -48,10 +48,14 @@ def finish(jid, job_text, result):
              f"{st.get('eval_tokens', '?')} tokens out  ·  {st.get('wall_s', '?')} s",
              f"- transcript: `runs/{jid}/transcript.jsonl`  (`llm log {jid}`)"]
     gate = result.get("gate")
-    if gate and gate.get("status") in ("passed", "failed"):
+    if gate and gate.get("status") in ("passed", "failed", "pre-failing"):
         names = ", ".join(("" if c["passed"] else "FAILED ") + c["name"] for c in gate.get("checks", []))
         lines.insert(-1, f"- final gate (run by the harness): **{gate['status']}** - {names}"
                          + (f"  ·  {gate['rounds'] - 1} fix round(s)" if gate.get("rounds", 1) > 1 else ""))
+        if gate.get("already_failing"):
+            lines.insert(-1, "- NOTE: " + ", ".join(f"`{n}`" for n in gate["already_failing"])
+                         + " was already failing before this job, so it was not counted against the model."
+                         + " Fix it in the project, or this gate verifies nothing.")
     elif gate:
         lines.insert(-1, "- final gate: none configured for this project - the result is UNVERIFIED")
     if st.get("files_changed") or st.get("screenshots"):
