@@ -125,6 +125,44 @@ look at it before you finish - layout problems do not show up in tests. Compare 
 fix what is wrong, and say in your summary what you saw."""
 
 
+# Sampling options a preset may set, and the range each is clamped to. Anything else is refused:
+# a typo'd key would otherwise be passed through and silently ignored by the backend.
+SAMPLING_RANGES = {"temperature": (0.0, 2.0), "top_p": (0.0, 1.0), "top_k": (0, 1000), "min_p": (0.0, 1.0),
+                   "presence_penalty": (-2.0, 2.0), "frequency_penalty": (-2.0, 2.0),
+                   "repeat_penalty": (0.0, 2.0)}
+
+
+def sampling_preset(cfg, name):
+    """The named preset as {"think": options, "plain": options}, every value clamped to its range.
+    An unknown preset or option is an error: a bake-off arm that silently ran on defaults is worse
+    than one that did not run."""
+    presets = dict(C.DEFAULT_CONFIG.get("sampling_presets") or {})
+    presets.update(cfg.get("sampling_presets") or {})
+    if name not in presets:
+        raise ValueError(f"unknown sampling preset '{name}'. Known: {', '.join(sorted(presets))}")
+    out = {}
+    for kind in ("think", "plain"):
+        opts = {}
+        for k, v in ((presets[name] or {}).get(kind) or {}).items():
+            if k not in SAMPLING_RANGES:
+                raise ValueError(f"sampling preset '{name}': unknown option '{k}'. "
+                                 f"Allowed: {', '.join(sorted(SAMPLING_RANGES))}")
+            lo, hi = SAMPLING_RANGES[k]
+            try:
+                v = int(v) if isinstance(lo, int) else float(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"sampling preset '{name}': {k} must be a number, not {v!r}") from None
+            opts[k] = min(max(v, lo), hi)
+        out[kind] = opts
+    return out
+
+
+def tps(*uses):
+    """Generated tokens per second over [turns, tokens, nanoseconds] tallies; None when not reported."""
+    tok, ns = sum(u[1] for u in uses), sum(u[2] for u in uses)
+    return round(tok / (ns / 1e9), 1) if ns else None
+
+
 def open_items(run_dir):
     """Unticked `- [ ]` lines in the model's own NOTES.md: what it said it still had to do."""
     notes = run_dir / "artifacts" / "NOTES.md"
@@ -772,6 +810,10 @@ def main():
         if think_mode not in ("on", "auto", "off"):
             think_mode = "auto"
         think_level = str(cfg.get("think_level") or "").strip().lower() or None
+        # Sampling is a named preset so a comparison between two settings records which one each job ran.
+        samp_name = str(meta.get("sampling") or cfg.get("sampling") or "legacy").strip().lower()
+        samp = sampling_preset(cfg, samp_name)
+        samp_use = {"think": [0, 0, 0], "plain": [0, 0, 0]}     # turns, generated tokens, generation ns
         try:
             think_budget = max(0.0, float(cfg.get("think_budget") or 0))
         except (TypeError, ValueError):
@@ -788,7 +830,7 @@ def main():
         tr.log(type="job_start", job_id=job_id, model=model, num_ctx=num_ctx,
                **{"from": meta.get("from")}, project=meta.get("project"), web=sb.web,
                mounts=sorted(sb.mounts), read_ceiling_tokens=int(READ_CEILING * num_ctx), tools=use_tools,
-               think=think_mode, think_budget_tokens=think_cap or None, ask=ask)
+               think=think_mode, think_budget_tokens=think_cap or None, sampling=samp_name, ask=ask)
         if dash.start(model, ask, meta.get("group"), meta.get("step")):
             tr.log(type="note", text=f"dashboard: {dash.where['mode']} run -> {dash.where['url']}")
 
@@ -869,7 +911,8 @@ def main():
         for turn in range(1, max_turns + 1):
             sb.turn = turn
             payload = {"model": model, "messages": wire(messages), "stream": False,
-                       "options": {"num_ctx": num_ctx, "temperature": 0.3, "num_predict": turn_cap}}
+                       "options": {"num_ctx": num_ctx, "num_predict": turn_cap}}
+            on = False
             if tools:
                 payload["tools"] = tools
             if "thinking" in caps:
@@ -885,6 +928,8 @@ def main():
                 payload["think"] = think_level if (on and think_level) else on
                 if on:
                     last_think, think_turns = turn, think_turns + 1
+            kind = "think" if on else "plain"
+            payload["options"].update(samp[kind])
             no_think -= 1
             think_next = False
             t0 = time.time()
@@ -893,6 +938,10 @@ def main():
             msg = resp.get("message", {})
             ptok, etok = resp.get("prompt_eval_count") or 0, resp.get("eval_count") or 0
             totals["prompt"], totals["eval"] = ptok, totals["eval"] + etok
+            samp_use[kind][0] += 1
+            if resp.get("eval_duration"):
+                samp_use[kind][1] += etok
+                samp_use[kind][2] += resp["eval_duration"]
             usage["fresh"] += max(0, ptok - usage["prev"])
             usage["cached"] += min(ptok, usage["prev"])
             usage["prev"] = ptok
@@ -1130,7 +1179,11 @@ def main():
                            "lines_removed": sum(c["removed"] for c in changed), "warnings": len(warnings),
                            "think": think_mode, "think_turns": think_turns,
                            "gates_already_failing": len(stale_gates(result)),
-                           "open_items": len(open_items(run_dir))}
+                           "open_items": len(open_items(run_dir)),
+                           "sampling": samp_name, "sampling_options": samp,
+                           "sampling_turns": {k: v[0] for k, v in samp_use.items()},
+                           "tokens_per_s": tps(samp_use["think"], samp_use["plain"]),
+                           "tokens_per_s_by_turn": {k: tps(v) for k, v in samp_use.items()}}
     except Exception as e:
         result.update(status="error", error=f"{type(e).__name__}: {e}")
 
