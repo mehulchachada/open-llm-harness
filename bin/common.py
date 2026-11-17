@@ -29,6 +29,14 @@ DEFAULT_CONFIG = {
                                         # the level to ask for on a thinking turn; "" sends on/off
     "think_budget": 0.10,               # one turn may spend this share of the window generating before
                                         # reasoning is switched off for a few turns; 0 = no ceiling
+    "sampling": "legacy",               # sampling preset for jobs that do not name one (`sampling:` key)
+    "sampling_presets": {               # name -> Ollama options for a reasoning turn and for a plain one.
+                                        # config.json may add presets or replace these by name.
+        "legacy": {"think": {"temperature": 0.3}, "plain": {"temperature": 0.3}},
+        "qwen-recommended": {           # Qwen's published settings for thinking / non-thinking mode
+            "think": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0},
+            "plain": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "min_p": 0}},
+    },
     "gate_baseline": True,              # when a gate fails, re-run it on the files as they were before
                                         # the job, so one that was already red is not the model's fault
     "searxng": "http://127.0.0.1:8888", # only used by jobs with `web: true`

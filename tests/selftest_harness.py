@@ -43,6 +43,8 @@ def run(script, ptok=2000, front=''):
                    "eval_count": step.get("eval_count", 50)}
             if step.get("done_reason"):
                 out["done_reason"] = step["done_reason"]
+            if step.get("eval_duration"):
+                out["eval_duration"] = step["eval_duration"]
             return out
         msg = {"content": step if isinstance(step, str) else "", **({} if isinstance(step, str) else {"tool_calls": step})}
         return {"message": msg, "prompt_eval_count": ptok(len(sent)) if callable(ptok) else ptok, "eval_count": 50}
@@ -256,6 +258,47 @@ res, notes, sent = run([[call("write_file", path="artifacts/NOTES.md", content="
 check("open items: a fully ticked list, or none at all, costs nothing",
       res["status"] == "ok" and not any("unticked" in n for n in notes) and len(sent) == 3)
 (repo / "o.txt").unlink(missing_ok=True)
+
+# S. sampling is a named preset, chosen per turn by whether the turn reasons
+res, notes, sent = run([[call("write_file", path="repo/s.txt", content="1")], "done"])
+check("sampling: a job naming no preset sends exactly what it always did - temperature 0.3, nothing else",
+      all({k: v for k, v in p["options"].items() if k not in ("num_ctx", "num_predict")} == {"temperature": 0.3}
+          for p in PAYLOADS) and res["stats"]["sampling"] == "legacy")
+res, notes, sent = run([[call("write_file", path="repo/s.txt", content="2")], "done"],
+                       front="sampling: qwen-recommended\n")
+check("sampling: qwen-recommended sends 0.6 on a reasoning turn and 0.7 on a plain one",
+      PAYLOADS[0]["think"] is True and PAYLOADS[0]["options"]["temperature"] == 0.6
+      and PAYLOADS[0]["options"]["top_p"] == 0.95 and PAYLOADS[0]["options"]["top_k"] == 20
+      and PAYLOADS[1]["think"] is False and PAYLOADS[1]["options"]["temperature"] == 0.7
+      and PAYLOADS[1]["options"]["top_p"] == 0.8)
+check("sampling: the result records the preset, what it sent and how many turns of each kind",
+      res["stats"]["sampling"] == "qwen-recommended" and res["stats"]["sampling_turns"] == {"think": 1, "plain": 1}
+      and res["stats"]["sampling_options"]["plain"]["temperature"] == 0.7)
+res, notes, sent = run(["done"], front="sampling: nope\n")
+check("sampling: an unknown preset fails the job, named, before anything is sent to the model",
+      res["status"] == "error" and "unknown sampling preset 'nope'" in (res["error"] or "") and not PAYLOADS)
+CFG["sampling_presets"] = {"hot": {"think": {"temperature": 9, "top_k": -5}, "plain": {}},
+                           "typo": {"think": {"temprature": 0.5}}}
+res, notes, sent = run(["done"], front="sampling: hot\n")
+check("sampling: values from the config are clamped to their range",
+      PAYLOADS[0]["options"]["temperature"] == 2.0 and PAYLOADS[0]["options"]["top_k"] == 0)
+res, notes, sent = run(["done"], front="sampling: typo\n")
+check("sampling: a misspelt option is refused, not passed through and ignored",
+      res["status"] == "error" and "unknown option 'temprature'" in (res["error"] or ""))
+CFG.pop("sampling_presets")
+fast = {"content": "", "tool_calls": [call("write_file", path="repo/s.txt", content="3")],
+        "eval_count": 100, "eval_duration": 2_000_000_000}
+res, notes, sent = run([fast, {"content": "done", "eval_count": 300, "eval_duration": 3_000_000_000}])
+check("sampling: generation speed is recorded overall and per kind of turn",
+      res["stats"]["tokens_per_s"] == 80.0
+      and res["stats"]["tokens_per_s_by_turn"] == {"think": 50.0, "plain": 100.0})
+CAPS[:] = ["tools"]
+res, notes, sent = run([[call("write_file", path="repo/s.txt", content="4")], "done"],
+                       front="sampling: qwen-recommended\n")
+check("sampling: a model that cannot reason gets the plain settings on every turn",
+      all(p["options"]["temperature"] == 0.7 for p in PAYLOADS))
+CAPS[:] = ["tools", "thinking"]
+(repo / "s.txt").unlink(missing_ok=True)
 
 # P. a model without thinking is untouched by any of this
 CAPS[:] = ["tools"]
