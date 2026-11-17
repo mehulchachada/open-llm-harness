@@ -29,6 +29,8 @@ may run.
 | `max_ctx` | `65536` | Upper limit for `--ctx`. Set it to what fits in your VRAM with the default model. |
 | `think` | `"auto"` | Reasoning, on a model that has it: `on` every turn, `auto` only where the turn decides something, `off` never. A job overrides it with `--think`. |
 | `think_level` | `""` | If the backend takes a reasoning level (`low`, `medium`, `high`), the level to ask for on a thinking turn. Empty sends a plain on/off. |
+| `sampling` | `"legacy"` | Sampling preset for jobs that do not name one. A job picks its own with `sampling:` in its front matter or `llm submit --sampling`. See [Sampling](#sampling). |
+| `sampling_presets` | `legacy`, `qwen-recommended` | Named presets, each a `think` and a `plain` set of Ollama options. Entries in config.json are added to these, or replace one of the same name. |
 | `think_budget` | `0.10` | Share of the window one turn may generate before reasoning is switched off for the next few turns. `0` removes the ceiling. |
 | `gate_baseline` | `true` | When a gate fails, re-run it on the files as they were before the job, so a gate that was already failing is reported rather than charged to the model. Costs nothing when the gates pass. |
 | `searxng` | `http://127.0.0.1:8888` | SearXNG instance used by `web_search`. Only jobs with `web: true` touch it. It must have the JSON output format enabled. |
@@ -61,6 +63,34 @@ tends to become a run of them.
 
 `result.json` records `think` and `think_turns` for every job, so the setting can be compared
 against your own work rather than taken on trust.
+
+## Sampling
+
+Temperature and the other sampling options come from a named preset. Each preset has two sets: `think`,
+sent on a turn that reasons, and `plain`, sent on one that does not (and on every turn of a model that
+cannot reason). Model vendors often publish different settings for the two modes, and `think: auto`
+switches between them within a job.
+
+```json
+"sampling": "legacy",
+"sampling_presets": {
+  "legacy": {"think": {"temperature": 0.3}, "plain": {"temperature": 0.3}},
+  "qwen-recommended": {
+    "think": {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0},
+    "plain": {"temperature": 0.7, "top_p": 0.8,  "top_k": 20, "min_p": 0}}
+}
+```
+
+`legacy` is what the harness has always sent, so it is the default. Options a set leaves out come from
+the model's own defaults (its Modelfile). Allowed options are `temperature`, `top_p`, `top_k`, `min_p`,
+`presence_penalty`, `frequency_penalty` and `repeat_penalty`; each is clamped to a sane range, and a
+misspelt option or an unknown preset name fails the job before the model is called, rather than
+quietly running it on defaults.
+
+To compare presets, run the same jobs under each. `result.json` records `sampling` (the preset),
+`sampling_options` (what was actually sent), `sampling_turns` (turns of each kind), and generation speed
+as `tokens_per_s` and `tokens_per_s_by_turn`. Speed matters here: with a draft model for speculative
+decoding, a higher temperature usually means fewer accepted draft tokens.
 
 ## Projects
 

@@ -42,6 +42,13 @@ CUT_NUDGE = ("Your last turn was cut off: you spent the whole turn reasoning and
 SUMMARY_NUDGE = ("Your last turn produced only reasoning: no tool call and no answer, so nothing of it was "
                  "kept. Do not reason further and do not start new work. Reply now in plain text: what you "
                  "did, file by file, and anything you could not finish or could not check.")
+CONTINUE_NUDGE = ("Your last turn produced only reasoning and no tool call, so nothing of it was kept. "
+                  "Do not plan further. Make your next tool call now and carry on with the next unfinished "
+                  "step in artifacts/NOTES.md. Only when every step is done, reply with your final summary.")
+OPEN_NUDGE = ("You answered as if the job were finished, but artifacts/NOTES.md still has unticked items:\n"
+              "{items}\n\nCarry on with the next one now. Tick each item when it is done (`- [x]`). If an "
+              "item cannot be done, mark it `- [-]` and say why in your final answer.")
+OPEN_ITEM = re.compile(r"^\s*[-*+]\s+\[ \]\s*(.+?)\s*$", re.M)
 READ_CHUNK = 12000           # max chars one read_file / web_fetch returns
 GATE_ROUNDS = 2              # times the model gets a failed final gate back to fix before the job is failed
 GATE_TAIL = 2500             # chars of one failed gate's output handed back to the model
@@ -103,9 +110,10 @@ This job has EDIT RIGHTS on part of repo/ (the writable paths are listed in the 
 - Keep your reasoning short. NEVER draft file contents in your reasoning: it is thrown away and you
   would have to write everything a second time. Decide the approach in a few sentences, write the
   file with write_file, run the checks, then improve it with edit_file. One file at a time.
-- Keep artifacts/NOTES.md up to date as you go (what is done, what is next). Whenever old tool output
-  is removed, the harness shows you those notes, the files you have changed and the last result of
-  each check - trust that state instead of re-reading files to rebuild it.
+- Keep artifacts/NOTES.md up to date as you go (what is done, what is next). If you keep a checklist
+  there, tick each item (`- [x]`) as you finish it: a final answer while items are unticked is sent back.
+  Whenever old tool output is removed, the harness shows you those notes, the files you have changed
+  and the last result of each check - trust that state instead of re-reading files to rebuild it.
 - You are done only when the checks pass. When you finish, the harness itself runs the project's final
   gate (typecheck, tests, formatting and so on). If the gate fails you get its output back to fix.
 - Then give a plain-text summary: files changed, what each change does, anything you could not finish."""
@@ -115,6 +123,53 @@ You can SEE the running app: the screenshot tool opens a page of the project's l
 shows you the picture. If the task changes how a page looks, take a screenshot after the checks pass and
 look at it before you finish - layout problems do not show up in tests. Compare it with what was asked,
 fix what is wrong, and say in your summary what you saw."""
+
+
+# Sampling options a preset may set, and the range each is clamped to. Anything else is refused:
+# a typo'd key would otherwise be passed through and silently ignored by the backend.
+SAMPLING_RANGES = {"temperature": (0.0, 2.0), "top_p": (0.0, 1.0), "top_k": (0, 1000), "min_p": (0.0, 1.0),
+                   "presence_penalty": (-2.0, 2.0), "frequency_penalty": (-2.0, 2.0),
+                   "repeat_penalty": (0.0, 2.0)}
+
+
+def sampling_preset(cfg, name):
+    """The named preset as {"think": options, "plain": options}, every value clamped to its range.
+    An unknown preset or option is an error: a bake-off arm that silently ran on defaults is worse
+    than one that did not run."""
+    presets = dict(C.DEFAULT_CONFIG.get("sampling_presets") or {})
+    presets.update(cfg.get("sampling_presets") or {})
+    if name not in presets:
+        raise ValueError(f"unknown sampling preset '{name}'. Known: {', '.join(sorted(presets))}")
+    out = {}
+    for kind in ("think", "plain"):
+        opts = {}
+        for k, v in ((presets[name] or {}).get(kind) or {}).items():
+            if k not in SAMPLING_RANGES:
+                raise ValueError(f"sampling preset '{name}': unknown option '{k}'. "
+                                 f"Allowed: {', '.join(sorted(SAMPLING_RANGES))}")
+            lo, hi = SAMPLING_RANGES[k]
+            try:
+                v = int(v) if isinstance(lo, int) else float(v)
+            except (TypeError, ValueError):
+                raise ValueError(f"sampling preset '{name}': {k} must be a number, not {v!r}") from None
+            opts[k] = min(max(v, lo), hi)
+        out[kind] = opts
+    return out
+
+
+def tps(*uses):
+    """Generated tokens per second over [turns, tokens, nanoseconds] tallies; None when not reported."""
+    tok, ns = sum(u[1] for u in uses), sum(u[2] for u in uses)
+    return round(tok / (ns / 1e9), 1) if ns else None
+
+
+def open_items(run_dir):
+    """Unticked `- [ ]` lines in the model's own NOTES.md: what it said it still had to do."""
+    notes = run_dir / "artifacts" / "NOTES.md"
+    try:
+        return OPEN_ITEM.findall(notes.read_text(encoding="utf-8", errors="replace")) if notes.is_file() else []
+    except OSError:
+        return []
 
 
 def stale_gates(result):
@@ -755,6 +810,10 @@ def main():
         if think_mode not in ("on", "auto", "off"):
             think_mode = "auto"
         think_level = str(cfg.get("think_level") or "").strip().lower() or None
+        # Sampling is a named preset so a comparison between two settings records which one each job ran.
+        samp_name = str(meta.get("sampling") or cfg.get("sampling") or "legacy").strip().lower()
+        samp = sampling_preset(cfg, samp_name)
+        samp_use = {"think": [0, 0, 0], "plain": [0, 0, 0]}     # turns, generated tokens, generation ns
         try:
             think_budget = max(0.0, float(cfg.get("think_budget") or 0))
         except (TypeError, ValueError):
@@ -771,7 +830,7 @@ def main():
         tr.log(type="job_start", job_id=job_id, model=model, num_ctx=num_ctx,
                **{"from": meta.get("from")}, project=meta.get("project"), web=sb.web,
                mounts=sorted(sb.mounts), read_ceiling_tokens=int(READ_CEILING * num_ctx), tools=use_tools,
-               think=think_mode, think_budget_tokens=think_cap or None, ask=ask)
+               think=think_mode, think_budget_tokens=think_cap or None, sampling=samp_name, ask=ask)
         if dash.start(model, ask, meta.get("group"), meta.get("step")):
             tr.log(type="note", text=f"dashboard: {dash.where['mode']} run -> {dash.where['url']}")
 
@@ -833,6 +892,7 @@ def main():
         turn_cap, no_think, recoveries = max(4096, int(num_ctx * TURN_SHARE)), 0, 0
         think_next, last_think, think_turns = False, 0, 0
         idle_reads, stall_nudges, gate_rounds, stalled = 0, 0, 0, False
+        open_handed = False
 
         def record_gate(report):
             # Only gates this job broke count against it. One that was already failing is reported, so
@@ -851,7 +911,8 @@ def main():
         for turn in range(1, max_turns + 1):
             sb.turn = turn
             payload = {"model": model, "messages": wire(messages), "stream": False,
-                       "options": {"num_ctx": num_ctx, "temperature": 0.3, "num_predict": turn_cap}}
+                       "options": {"num_ctx": num_ctx, "num_predict": turn_cap}}
+            on = False
             if tools:
                 payload["tools"] = tools
             if "thinking" in caps:
@@ -867,6 +928,8 @@ def main():
                 payload["think"] = think_level if (on and think_level) else on
                 if on:
                     last_think, think_turns = turn, think_turns + 1
+            kind = "think" if on else "plain"
+            payload["options"].update(samp[kind])
             no_think -= 1
             think_next = False
             t0 = time.time()
@@ -875,6 +938,10 @@ def main():
             msg = resp.get("message", {})
             ptok, etok = resp.get("prompt_eval_count") or 0, resp.get("eval_count") or 0
             totals["prompt"], totals["eval"] = ptok, totals["eval"] + etok
+            samp_use[kind][0] += 1
+            if resp.get("eval_duration"):
+                samp_use[kind][1] += etok
+                samp_use[kind][2] += resp["eval_duration"]
             usage["fresh"] += max(0, ptok - usage["prev"])
             usage["cached"] += min(ptok, usage["prev"])
             usage["prev"] = ptok
@@ -920,11 +987,16 @@ def main():
                 # fail the job; cut the reasoning and ask for whichever of the two was missing.
                 recoveries, no_think = recoveries + 1, THINK_COOLDOWN
                 did_work = bool(sb.touched) or any(f.is_file() for f in (run_dir / "artifacts").rglob("*"))
+                # Asking for a summary tells the model to stop, and whatever it says next is taken as its
+                # final answer. That is right near the end of the job, and wrong in the middle of one: a
+                # job once ended "ok" at turn 19 of 90 with six of seven items untouched.
+                late = sb.closed or turn > max_turns - LATE_TURNS
                 tr.log(type="note", text=f"turn {turn} generated {etok} tokens ({thought} chars of reasoning) "
                        f"with no tool call and no answer; retrying with reasoning switched off "
                        f"({recoveries}/{MAX_RECOVERIES})")
                 messages.append({"role": "user",
-                                 "content": SUMMARY_NUDGE if (mute and did_work) else CUT_NUDGE})
+                                 "content": (SUMMARY_NUDGE if late else CONTINUE_NUDGE) if did_work
+                                 else CUT_NUDGE})
                 continue
 
             # num_predict did not hold, so hold the line here: a turn that generated more than the budget
@@ -950,6 +1022,17 @@ def main():
                         f"{round(100 * ptok / num_ctx)}% of the {num_ctx} token window. That is a reasoning "
                         f"runaway, not a full window: resubmit with `think: off` or a narrower ask."))
                     break
+                # The model says it is done, but its own checklist says otherwise: send it back once.
+                left = open_items(run_dir)
+                if left and not open_handed and turn < max_turns and not sb.closed:
+                    open_handed = True
+                    messages.append(kept)
+                    think_next = True
+                    messages.append({"role": "user", "content": OPEN_NUDGE.format(
+                        items="\n".join(f"- [ ] {x}" for x in left[:20]))})
+                    tr.log(type="note", text=f"final answer with {len(left)} unticked item(s) in NOTES.md: "
+                           "handed back to the model")
+                    continue
                 # The model says it is done. Its word is not the verdict: the harness runs the gate.
                 if sb.touched and sb.gates:
                     report = sb.run_gates()
@@ -974,6 +1057,12 @@ def main():
                         break
                 elif sb.touched:
                     result["gate"] = {"status": "none", "rounds": 0, "checks": []}
+                if left:
+                    # Gates passing only says nothing is broken, not that the work is done.
+                    result.update(status="incomplete", final=msg.get("content", ""), error=(
+                        f"the model stopped with {len(left)} unticked item(s) in artifacts/NOTES.md: "
+                        + "; ".join(x[:80] for x in left[:5]) + (" ..." if len(left) > 5 else "")))
+                    break
                 result.update(status="ok", final=msg.get("content", ""))
                 break
             messages.append(kept)
@@ -1089,7 +1178,12 @@ def main():
                            "lines_added": sum(c["added"] for c in changed),
                            "lines_removed": sum(c["removed"] for c in changed), "warnings": len(warnings),
                            "think": think_mode, "think_turns": think_turns,
-                           "gates_already_failing": len(stale_gates(result))}
+                           "gates_already_failing": len(stale_gates(result)),
+                           "open_items": len(open_items(run_dir)),
+                           "sampling": samp_name, "sampling_options": samp,
+                           "sampling_turns": {k: v[0] for k, v in samp_use.items()},
+                           "tokens_per_s": tps(samp_use["think"], samp_use["plain"]),
+                           "tokens_per_s_by_turn": {k: tps(v) for k, v in samp_use.items()}}
     except Exception as e:
         result.update(status="error", error=f"{type(e).__name__}: {e}")
 
